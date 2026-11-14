@@ -1,6 +1,11 @@
 import { CsvError } from "./CsvError.js";
 import { normalize_columns } from "./normalize_columns.js";
 import { underscore } from "../utils/underscore.js";
+import {
+  delimiter_discover_default_preferred,
+  delimiter_discover_default_score,
+  delimiter_discover_default_size,
+} from "../utils/delimiter_discover.js";
 
 const normalize_options = function (opts) {
   const options = {};
@@ -24,7 +29,17 @@ const normalize_options = function (opts) {
     ];
   }
   // Normalize option `delimiter`
+  // The literal "auto" (string or buffer) requests automatic discovery from
+  // the incoming records. Without this conversion it would be emitted as a
+  // literal four-character separator, fusing every column into one string.
+  const delimiter_auto_requested =
+    options.delimiter === "auto" ||
+    (Buffer.isBuffer(options.delimiter) &&
+      options.delimiter.toString() === "auto");
   if (options.delimiter === undefined || options.delimiter === null) {
+    options.delimiter = ",";
+  } else if (delimiter_auto_requested) {
+    // Comma is only a placeholder until discovery runs on the first records.
     options.delimiter = ",";
   } else if (Buffer.isBuffer(options.delimiter)) {
     options.delimiter = options.delimiter.toString();
@@ -35,6 +50,21 @@ const normalize_options = function (opts) {
         `got ${JSON.stringify(options.delimiter)}`,
       ]),
     ];
+  }
+  // Automatic discovery configuration is internal to the stringifier. It is
+  // stored as a non-enumerable property so the public `options` shape (and its
+  // enumerated keys) stays identical to the explicit-delimiter behavior.
+  if (delimiter_auto_requested) {
+    Object.defineProperty(options, "delimiter_auto", {
+      value: {
+        preferred: delimiter_discover_default_preferred,
+        score: delimiter_discover_default_score,
+        size: delimiter_discover_default_size,
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
   }
   // Normalize option `quote`
   if (options.quote === undefined || options.quote === null) {

@@ -2,7 +2,11 @@ import { normalize_columns_array } from "./normalize_columns_array.js";
 import { init_state } from "./init_state.js";
 import { normalize_options } from "./normalize_options.js";
 import { CsvError } from "./CsvError.js";
-import { delimiter_discover } from "../utils/delimiter_discover.js";
+import {
+  delimiter_discover,
+  delimiter_records,
+  delimiter_score,
+} from "../utils/delimiter_discover.js";
 
 const isRecordEmpty = function (record) {
   return record.every(
@@ -108,11 +112,55 @@ const transform = function (original_options = {}) {
         nextBuf = undefined;
         // this.delimiterBufPrevious = delimiterBuf;
         if (end || delimiterBuf.length > delimiter_auto.size) {
-          this.options.delimiter = [
-            Buffer.from(
-              delimiter_discover(delimiterBuf, this.options.delimiter_auto),
-            ),
-          ];
+          // Score every candidate against the sampling window. The discovery
+          // uses the exact same routine and options as `csv-stringify`, so the
+          // two sides of a pipeline converge on the same delimiter.
+          let recordCodes = delimiter_records(delimiterBuf);
+          // On a size-driven (streaming) cutoff the last record may be
+          // truncated in the middle of a line, which would make its field
+          // count differ from the complete rows and wrongly fail the
+          // structural test. Discard it before scoring. On `end` every record
+          // is complete, so nothing is discarded.
+          let minRecords = 2;
+          if (!end && recordCodes.length > 1) {
+            recordCodes = recordCodes.slice(0, -1);
+          }
+          // A very small window can leave a single complete record. A
+          // delimiter can still be trusted on that record alone as long as it
+          // splits it into at least two fields.
+          if (recordCodes.length === 1) minRecords = 1;
+          // An empty sample preserves the historical empty-input behavior:
+          // parsing resolves to no records instead of a discovery error.
+          if (recordCodes.length > 0) {
+            const result = delimiter_score(
+              recordCodes,
+              this.options.delimiter_auto,
+              minRecords,
+            );
+            // Refuse to silently ingest data when no trustworthy delimiter can
+            // be discovered, instead of electing an arbitrary content character.
+            if (!result.trusted) {
+              return new CsvError(
+                "CSV_DELIMITER_NOT_DISCOVERED",
+                [
+                  "Invalid delimiter discovery:",
+                  "no field delimiter could be discovered from the sampled data,",
+                  `sampled ${delimiterBuf.length} bytes over a maximum window of ${delimiter_auto.size} bytes,`,
+                  "set the `delimiter` option explicitly to parse this data",
+                ],
+                this.options,
+              );
+            }
+            this.options.delimiter = [
+              Buffer.from(String.fromCharCode(result.char_code)),
+            ];
+          } else {
+            this.options.delimiter = [
+              Buffer.from(
+                delimiter_discover(delimiterBuf, this.options.delimiter_auto),
+              ),
+            ];
+          }
           this.state.previousBuf = delimiterBuf;
           this.state.delimiterBufPrevious = undefined;
           this.state.delimiterDiscovered = true;

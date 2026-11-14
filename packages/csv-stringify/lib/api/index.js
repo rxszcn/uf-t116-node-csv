@@ -1,7 +1,12 @@
 import { get } from "../utils/get.js";
 import { is_object } from "../utils/is_object.js";
+import { CsvError } from "./CsvError.js";
 import { normalize_columns } from "./normalize_columns.js";
 import { normalize_options } from "./normalize_options.js";
+import {
+  delimiter_records,
+  delimiter_score,
+} from "../utils/delimiter_discover.js";
 const bom_utf8 = Buffer.from([239, 187, 191]);
 // True when appending `separator` after `value` would let `parse` find
 // `separator` starting inside `value`. Besides the field containing the whole
@@ -40,6 +45,65 @@ const stringifier = function (options, state, info) {
     options: options,
     state: state,
     info: info,
+    // Record buffering used while the field delimiter is discovered. `buffer`
+    // holds the input records and `buffer_size` tracks their cast character
+    // count to apply the same sampling window as the parsing side.
+    state_auto: {
+      buffer: [],
+      size: 0,
+    },
+    // Run automatic delimiter discovery over the buffered records and, on
+    // success, emit every buffered record again through the regular path.
+    __delimiter_auto_finalize: function (push) {
+      const { err, recordCodes } = delimiter_records(
+        this.state_auto.buffer,
+        this.options.columns,
+        (value, context) => this.__cast(value, context),
+      );
+      if (err !== undefined) return err;
+      const result = delimiter_score(recordCodes, this.options.delimiter_auto);
+      if (!result.trusted) {
+        return new CsvError("CSV_OPTION_DELIMITER_AUTO_UNDISCOVERABLE", [
+          "Invalid option `delimiter`:",
+          "no field delimiter could be discovered from the sampled records,",
+          `sampled ${this.state_auto.size} characters over a maximum window of ${this.options.delimiter_auto.size} characters,`,
+          "set the `delimiter` option explicitly to stringify this data",
+        ]);
+      }
+      this.options.delimiter = String.fromCharCode(result.char_code);
+      const buffered = this.state_auto.buffer;
+      this.state_auto.buffer = [];
+      this.state_auto.size = 0;
+      this.state.pending_delimiter_auto = false;
+      for (const record of buffered) {
+        const err = this.__transform(record, push);
+        if (err !== undefined) return err;
+      }
+      return undefined;
+    },
+    // Cast one record and return the total length of its serialized fields.
+    // Used only to bound the discovery sampling window.
+    __delimiter_auto_record_size: function (chunk) {
+      const fields = [];
+      if (Array.isArray(chunk)) {
+        for (const field of chunk) fields.push(field);
+      } else {
+        for (const column of this.options.columns)
+          fields.push(get(chunk, column.key));
+      }
+      let size = 0;
+      for (let i = 0; i < fields.length; i++) {
+        const [err, value] = this.__cast(fields[i], {
+          index: i,
+          column: Array.isArray(chunk) ? i : this.options.columns[i].key,
+          records: this.info.records,
+          header: false,
+        });
+        if (err !== undefined) return undefined;
+        if (value !== null && value !== undefined) size += String(value).length;
+      }
+      return size;
+    },
     __transform: function (chunk, push) {
       // Chunk validation
       if (!Array.isArray(chunk) && typeof chunk !== "object") {
@@ -63,6 +127,27 @@ const stringifier = function (options, state, info) {
           if (err) return;
           this.options.columns = columns;
         }
+      }
+      // Automatic delimiter discovery: keep buffering records until the
+      // sampling window is filled. The window and the scoring are identical to
+      // `csv-parse`, so both sides converge on the same delimiter.
+      if (this.state.pending_delimiter_auto === true) {
+        const size = this.__delimiter_auto_record_size(chunk);
+        if (size === undefined) {
+          return new CsvError("CSV_OPTION_DELIMITER_AUTO_UNDISCOVERABLE", [
+            "Invalid option `delimiter`:",
+            "a field could not be cast while sampling records for delimiter discovery,",
+            "set the `delimiter` option explicitly to stringify this data",
+          ]);
+        }
+        this.state_auto.buffer.push(chunk);
+        this.state_auto.size += size;
+        if (this.state_auto.size < this.options.delimiter_auto.size) {
+          return;
+        }
+        const err = this.__delimiter_auto_finalize(push);
+        if (err !== undefined) return err;
+        return;
       }
       // Emit the header
       if (this.info.records === 0) {

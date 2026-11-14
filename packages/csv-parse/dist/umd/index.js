@@ -5420,7 +5420,7 @@
                   "CSV_INVALID_OPTION_GROUP_COLUMNS_BY_NAME",
                   [
                     "Invalid option group_columns_by_name:",
-                    "expect an boolean,",
+                    "expect a boolean,",
                     `got ${JSON.stringify(options.group_columns_by_name)}`,
                   ],
                   options,
@@ -5478,6 +5478,19 @@
                 );
               }
               // Normalize option `delimiter_auto`
+              // The literal string "auto" on `delimiter` is an explicit request for
+              // automatic discovery, equivalent to `delimiter_auto: true`. It must be
+              // handled before `delimiter` is turned into a buffer, otherwise the four
+              // characters "auto" would be treated as a literal multi-character delimiter.
+              if (
+                options.delimiter === "auto" ||
+                (!Array.isArray(options.delimiter) &&
+                  isBuffer(options.delimiter) &&
+                  options.delimiter.toString() === "auto")
+              ) {
+                if (options.delimiter_auto === undefined) options.delimiter_auto = true;
+                options.delimiter = undefined;
+              }
               if (
                 options.delimiter_auto === undefined ||
                 options.delimiter_auto === null ||
@@ -6022,13 +6035,19 @@
               return options;
             };
 
-            // Discussed in [issue #400](https://github.com/adaltas/node-csv/issues/400)
-            // See https://github.com/python/cpython/blob/ea1b1c579f600cc85d145c60862b2e6b98701b24/Lib/csv.py#L349
-            const delimiter_discover = function (records, options) {
-              // Normalize the configuration
-              if (!options) {
-                ({ delimiter_auto: options } = normalize_options({ delimiter_auto: true }));
-              }
+            // Character codes excluded from the candidate set: a field delimiter cannot be
+            // a line break (the record delimiter) or the NUL character (an empty sample).
+            const delimiter_discover_excluded_codes = [0, 10, 13];
+            // A candidate is only trustworthy when every sampled record contains it and
+            // the sample spans at least two records. A character missing from one or more
+            // records cannot be the column delimiter (a delimiter appears on every row),
+            // and a single-record sample cannot distinguish a delimiter from content.
+            const delimiter_discover_min_records = 2;
+
+            // Convert a sample (raw buffer/string or an array of records) into an array of
+            // records, each record being an array of character codes. This is the single
+            // source of truth shared by the parsing and the stringifying sides.
+            const delimiter_records = function (records) {
               // Convert String to Buffer
               if (typeof records === "string") {
                 records = Buffer.from(records);
@@ -6045,33 +6064,108 @@
                   return records;
                 })(records);
               }
-              // Info array initialization, 127 entries, one per char code
+              // Normalize each record into an array of character (or byte) codes. Records
+              // produced by the parser are buffers, so the counting stays byte-level to
+              // preserve the historical discovery behavior.
+              return records.map(([record]) => {
+                const codes = new Array(record.length);
+                for (let i = 0; i < record.length; i++) {
+                  codes[i] = record.charCodeAt(i);
+                }
+                return codes;
+              });
+            };
+
+            // Structural test shared by both packages: splitting every sampled record on
+            // a candidate character must produce the same number of fields, and that
+            // number must be greater than one. Frequency alone cannot distinguish a
+            // delimiter from a content character present on every record (e.g. the letter
+            // "a" in `alpha/beta/gamma`, or a "c" present on every row but with a varying
+            // field count); only a real column delimiter makes every row share the same
+            // column count. This routine is intentionally strict and identical on both
+            // sides; the streaming parser handles a truncated sampling window separately
+            // by discarding its incomplete last record before calling it.
+            const delimiter_structural_match = function (recordCodes, charCode) {
+              let fieldCount;
+              for (const codes of recordCodes) {
+                // Number of fields is one more than the number of occurrences.
+                let count = 1;
+                for (const code of codes) if (code === charCode) count++;
+                if (count === 1) return false;
+                if (fieldCount === undefined) fieldCount = count;
+                else if (fieldCount !== count) return false;
+              }
+              return fieldCount !== undefined && fieldCount >= 2;
+            };
+
+            // Core scoring routine. Consumes an array of records (arrays of char codes) and
+            // the normalized `delimiter_auto` options. Returns the winning candidate
+            // information, including a `trusted` flag telling whether the winner is a
+            // plausible delimiter. Both `csv-parse` and `csv-stringify` call this function
+            // with identical options, guaranteeing that the same multi-source sample leads
+            // to the same delimiter decision on both sides.
+            const delimiter_score = function (
+              recordCodes,
+              options,
+              minRecords = delimiter_discover_min_records,
+            ) {
+              // Info array initialization, 127 entries, one per char code. `lines` stays
+              // sparse (undefined for records without the character) to preserve the
+              // historical standard-deviation computation; `records` explicitly counts
+              // the records containing the character, since a sparse array's `length`
+              // cannot be used for that purpose.
               const info = Array(127)
                 .fill()
-                .map(() => ({ lines: [] }));
+                .map(() => ({ lines: [], records: 0 }));
               // Traverse each records, count occurences per char code
-              records.map(([record], line) => {
-                for (let i = 0, l = record.length; i < l; i++) {
-                  // Count the character frequency
-                  const code = record.charCodeAt(i);
-                  if (info[code].lines[line] === undefined) info[code].lines[line] = 0;
+              recordCodes.forEach((codes, line) => {
+                for (const code of codes) {
+                  if (info[code].lines[line] === undefined) {
+                    info[code].lines[line] = 0;
+                    info[code].records++;
+                  }
                   info[code].lines[line]++;
                 }
               });
               // Traverse each char code, compute the score
-              info.map((info, i) => {
+              info.forEach((info, i) => {
                 info.char_code = i;
                 info.std = std(info.lines);
                 info.total = info.lines.reduce((acc, val) => acc + val, 0);
                 info.preferred = !!options.preferred[i];
                 info.score = options.score(info, options);
               });
-              // Extract the dominant character
-              const result = info.reduce(
-                (acc, info) => (acc.score > info.score ? acc : info),
-                {},
-              );
-              return String.fromCharCode(result.char_code);
+              const recordCount = recordCodes.length;
+              const eligible = (info) =>
+                !delimiter_discover_excluded_codes.includes(info.char_code) &&
+                info.total > 0;
+              // Winner selection keeps the historical behavior: the highest-scoring
+              // eligible character wins even when its field count is inconsistent across
+              // records. This preserves the documented `delimiter_discover` utility.
+              const result = info
+                .filter(eligible)
+                .reduce((acc, info) => (acc.score > info.score ? acc : info), {
+                  score: 0,
+                });
+              // Trust is evaluated independently of the winner selection. A trustworthy
+              // delimiter must satisfy the structural field-count test and have enough
+              // complete records to compare. This is what prevents a frequent content
+              // character (e.g. the letter "a" shared by every row) from silently becoming
+              // the delimiter.
+              result.trusted =
+                result.char_code !== undefined &&
+                recordCount >= minRecords &&
+                delimiter_structural_match(recordCodes, result.char_code);
+              return result;
+            };
+
+            const delimiter_discover = function (records, options) {
+              // Normalize the configuration
+              if (!options) {
+                ({ delimiter_auto: options } = normalize_options({ delimiter_auto: true }));
+              }
+              const result = delimiter_score(delimiter_records(records), options);
+              return String.fromCharCode(result.char_code === undefined ? 0 : result.char_code);
             };
 
             const std = function (array) {
@@ -6187,11 +6281,55 @@
                     nextBuf = undefined;
                     // this.delimiterBufPrevious = delimiterBuf;
                     if (end || delimiterBuf.length > delimiter_auto.size) {
-                      this.options.delimiter = [
-                        Buffer.from(
-                          delimiter_discover(delimiterBuf, this.options.delimiter_auto),
-                        ),
-                      ];
+                      // Score every candidate against the sampling window. The discovery
+                      // uses the exact same routine and options as `csv-stringify`, so the
+                      // two sides of a pipeline converge on the same delimiter.
+                      let recordCodes = delimiter_records(delimiterBuf);
+                      // On a size-driven (streaming) cutoff the last record may be
+                      // truncated in the middle of a line, which would make its field
+                      // count differ from the complete rows and wrongly fail the
+                      // structural test. Discard it before scoring. On `end` every record
+                      // is complete, so nothing is discarded.
+                      let minRecords = 2;
+                      if (!end && recordCodes.length > 1) {
+                        recordCodes = recordCodes.slice(0, -1);
+                      }
+                      // A very small window can leave a single complete record. A
+                      // delimiter can still be trusted on that record alone as long as it
+                      // splits it into at least two fields.
+                      if (recordCodes.length === 1) minRecords = 1;
+                      // An empty sample preserves the historical empty-input behavior:
+                      // parsing resolves to no records instead of a discovery error.
+                      if (recordCodes.length > 0) {
+                        const result = delimiter_score(
+                          recordCodes,
+                          this.options.delimiter_auto,
+                          minRecords,
+                        );
+                        // Refuse to silently ingest data when no trustworthy delimiter can
+                        // be discovered, instead of electing an arbitrary content character.
+                        if (!result.trusted) {
+                          return new CsvError(
+                            "CSV_DELIMITER_NOT_DISCOVERED",
+                            [
+                              "Invalid delimiter discovery:",
+                              "no field delimiter could be discovered from the sampled data,",
+                              `sampled ${delimiterBuf.length} bytes over a maximum window of ${delimiter_auto.size} bytes,`,
+                              "set the `delimiter` option explicitly to parse this data",
+                            ],
+                            this.options,
+                          );
+                        }
+                        this.options.delimiter = [
+                          Buffer.from(String.fromCharCode(result.char_code)),
+                        ];
+                      } else {
+                        this.options.delimiter = [
+                          Buffer.from(
+                            delimiter_discover(delimiterBuf, this.options.delimiter_auto),
+                          ),
+                        ];
+                      }
                       this.state.previousBuf = delimiterBuf;
                       this.state.delimiterBufPrevious = undefined;
                       this.state.delimiterDiscovered = true;
@@ -6854,7 +6992,7 @@
                     }
                   }
                   if (this.__isFloat(field)) {
-                    return [undefined, parseFloat(field)];
+                    return [undefined, Number(field)];
                   } else if (this.options.cast_date !== false) {
                     const info = this.__infoField();
                     return [undefined, this.options.cast_date.call(null, field, info)];
@@ -7061,6 +7199,7 @@
               // Implementation of `Transform._transform`
               _transform(buf, _, callback) {
                 if (this.state.stop === true) {
+                  callback();
                   return;
                 }
                 const err = this.api.parse(
@@ -7071,27 +7210,32 @@
                   },
                   () => {
                     this.push(null);
-                    this.end();
-                    // Fix #333 and break #410
-                    //   ko: api.stream.iterator.coffee
-                    //   ko with v21.4.0, ok with node v20.5.1: api.stream.finished # aborted (with generate())
-                    //   ko: api.stream.finished # aborted (with Readable)
-                    // this.destroy()
-                    // Fix #410 and partially break #333
-                    //   ok: api.stream.iterator.coffee
-                    //   ok: api.stream.finished # aborted (with generate())
-                    //   broken: api.stream.finished # aborted (with Readable)
-                    this.on("end", this.destroy);
+                    // Let buffered records be consumed before closing the writable side.
+                    // The source can still write chunks before the readable end event.
+                    this.on("end", () => {
+                      this.end(() => {
+                        // The stream polyfill of the browser builds has no `destroy` (#409)
+                        if (typeof this.destroy === "function") {
+                          this.destroy();
+                        }
+                      });
+                    });
                   },
                 );
                 if (err !== undefined) {
                   this.state.stop = true;
                 }
-                callback(err);
+                // Hold back upstream input until the final records have been consumed.
+                if (err === undefined && this.state.stop && !this.readableEnded) {
+                  this.once("end", callback);
+                } else {
+                  callback(err);
+                }
               }
               // Implementation of `Transform._flush`
               _flush(callback) {
                 if (this.state.stop === true) {
+                  callback();
                   return;
                 }
                 const err = this.api.parse(
@@ -7102,7 +7246,9 @@
                   },
                   () => {
                     this.push(null);
-                    this.on("end", this.destroy);
+                    if (typeof this.destroy === "function") {
+                      this.on("end", this.destroy);
+                    }
                   },
                 );
                 callback(err);
@@ -7134,13 +7280,11 @@
               const parser = new Parser(options);
               if (callback) {
                 const records =
-                  options === undefined || options.objname === undefined
-                    ? []
-                    : Object.create(null);
+                  parser.options.objname === undefined ? [] : Object.create(null);
                 parser.on("readable", function () {
                   let record;
                   while ((record = this.read()) !== null) {
-                    if (options === undefined || options.objname === undefined) {
+                    if (parser.options.objname === undefined) {
                       records.push(record);
                     } else {
                       Object.assign(records, {

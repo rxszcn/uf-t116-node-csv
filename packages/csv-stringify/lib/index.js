@@ -21,6 +21,8 @@ class Stringifier extends Transform {
     // Internal state
     this.state = {
       stop: false,
+      // Set while records are buffered for automatic delimiter discovery
+      pending_delimiter_auto: options.delimiter_auto !== undefined,
     };
     // Information
     this.info = {
@@ -47,10 +49,20 @@ class Stringifier extends Transform {
       // `callback` from being called in flush without any error.
       return;
     }
+    // Finalize automatic delimiter discovery with the records collected so
+    // far. No record at all (header-only/empty output) falls back to the
+    // comma default instead of failing, matching the empty-input behavior.
+    if (
+      this.state.pending_delimiter_auto === true &&
+      this.api.state_auto.buffer.length > 0
+    ) {
+      const err = this.api.__delimiter_auto_finalize(this.push.bind(this));
+      if (err !== undefined) return callback(err);
+    }
     if (this.info.records === 0) {
       this.api.bom(this.push.bind(this));
       const err = this.api.headers(this.push.bind(this));
-      if (err) callback(err);
+      if (err) return callback(err);
     }
     callback();
   }

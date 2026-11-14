@@ -163,8 +163,10 @@ export interface Options extends stream.TransformOptions {
   columns?: ReadonlyArray<string | ColumnOption> | PlainObject<string>;
   /**
    * Set the field delimiter, one character only, defaults to a comma.
+   * The literal string "auto" (or a buffer containing "auto") enables
+   * automatic delimiter discovery from the incoming records.
    */
-  delimiter?: string | Buffer;
+  delimiter?: "auto" | string | Buffer;
   /**
    * Add the value of "options.RecordDelimiter" on the last line, default to true.
    */

@@ -324,8 +324,10 @@ export interface Options<T = string[], U = T> {
   comment_no_infix?: OptionsNormalized["comment_no_infix"] | null;
   /**
    * Set the field delimiter. One character only, defaults to comma.
+   * The literal string "auto" (or a buffer containing "auto") is equivalent
+   * to enabling `delimiter_auto`, triggering automatic delimiter discovery.
    */
-  delimiter?: OptionsNormalized["delimiter"] | string | string[] | Buffer;
+  delimiter?: OptionsNormalized["delimiter"] | "auto" | string | string[] | Buffer;
   /**
    * Discover the field delimiter
    */

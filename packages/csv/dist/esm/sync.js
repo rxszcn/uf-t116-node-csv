@@ -5235,8 +5235,15 @@ const read = (options, state, size, push, close) => {
   // Get remaining buffer when fixedSize is enable
   if (options.fixedSize) {
     recordsLength = state.fixed_size_buffer.length;
+    if (size > 0 && recordsLength > size) {
+      const chunk = state.fixed_size_buffer.substr(0, size);
+      state.fixed_size_buffer = state.fixed_size_buffer.substr(size);
+      push(chunk);
+      return;
+    }
     if (recordsLength !== 0) {
       data.push(state.fixed_size_buffer);
+      state.fixed_size_buffer = "";
     }
   }
   // eslint-disable-next-line
@@ -5772,7 +5779,7 @@ const normalize_options$1 = function (opts) {
       "CSV_INVALID_OPTION_GROUP_COLUMNS_BY_NAME",
       [
         "Invalid option group_columns_by_name:",
-        "expect an boolean,",
+        "expect a boolean,",
         `got ${JSON.stringify(options.group_columns_by_name)}`,
       ],
       options,
@@ -5830,6 +5837,19 @@ const normalize_options$1 = function (opts) {
     );
   }
   // Normalize option `delimiter_auto`
+  // The literal string "auto" on `delimiter` is an explicit request for
+  // automatic discovery, equivalent to `delimiter_auto: true`. It must be
+  // handled before `delimiter` is turned into a buffer, otherwise the four
+  // characters "auto" would be treated as a literal multi-character delimiter.
+  if (
+    options.delimiter === "auto" ||
+    (!Array.isArray(options.delimiter) &&
+      isBuffer$1(options.delimiter) &&
+      options.delimiter.toString() === "auto")
+  ) {
+    if (options.delimiter_auto === undefined) options.delimiter_auto = true;
+    options.delimiter = undefined;
+  }
   if (
     options.delimiter_auto === undefined ||
     options.delimiter_auto === null ||
@@ -6374,13 +6394,19 @@ const normalize_options$1 = function (opts) {
   return options;
 };
 
-// Discussed in [issue #400](https://github.com/adaltas/node-csv/issues/400)
-// See https://github.com/python/cpython/blob/ea1b1c579f600cc85d145c60862b2e6b98701b24/Lib/csv.py#L349
-const delimiter_discover = function (records, options) {
-  // Normalize the configuration
-  if (!options) {
-    ({ delimiter_auto: options } = normalize_options$1({ delimiter_auto: true }));
-  }
+// Character codes excluded from the candidate set: a field delimiter cannot be
+// a line break (the record delimiter) or the NUL character (an empty sample).
+const delimiter_discover_excluded_codes$1 = [0, 10, 13];
+// A candidate is only trustworthy when every sampled record contains it and
+// the sample spans at least two records. A character missing from one or more
+// records cannot be the column delimiter (a delimiter appears on every row),
+// and a single-record sample cannot distinguish a delimiter from content.
+const delimiter_discover_min_records$1 = 2;
+
+// Convert a sample (raw buffer/string or an array of records) into an array of
+// records, each record being an array of character codes. This is the single
+// source of truth shared by the parsing and the stringifying sides.
+const delimiter_records$1 = function (records) {
   // Convert String to Buffer
   if (typeof records === "string") {
     records = Buffer.from(records);
@@ -6397,36 +6423,111 @@ const delimiter_discover = function (records, options) {
       return records;
     })(records);
   }
-  // Info array initialization, 127 entries, one per char code
+  // Normalize each record into an array of character (or byte) codes. Records
+  // produced by the parser are buffers, so the counting stays byte-level to
+  // preserve the historical discovery behavior.
+  return records.map(([record]) => {
+    const codes = new Array(record.length);
+    for (let i = 0; i < record.length; i++) {
+      codes[i] = record.charCodeAt(i);
+    }
+    return codes;
+  });
+};
+
+// Structural test shared by both packages: splitting every sampled record on
+// a candidate character must produce the same number of fields, and that
+// number must be greater than one. Frequency alone cannot distinguish a
+// delimiter from a content character present on every record (e.g. the letter
+// "a" in `alpha/beta/gamma`, or a "c" present on every row but with a varying
+// field count); only a real column delimiter makes every row share the same
+// column count. This routine is intentionally strict and identical on both
+// sides; the streaming parser handles a truncated sampling window separately
+// by discarding its incomplete last record before calling it.
+const delimiter_structural_match$1 = function (recordCodes, charCode) {
+  let fieldCount;
+  for (const codes of recordCodes) {
+    // Number of fields is one more than the number of occurrences.
+    let count = 1;
+    for (const code of codes) if (code === charCode) count++;
+    if (count === 1) return false;
+    if (fieldCount === undefined) fieldCount = count;
+    else if (fieldCount !== count) return false;
+  }
+  return fieldCount !== undefined && fieldCount >= 2;
+};
+
+// Core scoring routine. Consumes an array of records (arrays of char codes) and
+// the normalized `delimiter_auto` options. Returns the winning candidate
+// information, including a `trusted` flag telling whether the winner is a
+// plausible delimiter. Both `csv-parse` and `csv-stringify` call this function
+// with identical options, guaranteeing that the same multi-source sample leads
+// to the same delimiter decision on both sides.
+const delimiter_score$1 = function (
+  recordCodes,
+  options,
+  minRecords = delimiter_discover_min_records$1,
+) {
+  // Info array initialization, 127 entries, one per char code. `lines` stays
+  // sparse (undefined for records without the character) to preserve the
+  // historical standard-deviation computation; `records` explicitly counts
+  // the records containing the character, since a sparse array's `length`
+  // cannot be used for that purpose.
   const info = Array(127)
     .fill()
-    .map(() => ({ lines: [] }));
+    .map(() => ({ lines: [], records: 0 }));
   // Traverse each records, count occurences per char code
-  records.map(([record], line) => {
-    for (let i = 0, l = record.length; i < l; i++) {
-      // Count the character frequency
-      const code = record.charCodeAt(i);
-      if (info[code].lines[line] === undefined) info[code].lines[line] = 0;
+  recordCodes.forEach((codes, line) => {
+    for (const code of codes) {
+      if (info[code].lines[line] === undefined) {
+        info[code].lines[line] = 0;
+        info[code].records++;
+      }
       info[code].lines[line]++;
     }
   });
   // Traverse each char code, compute the score
-  info.map((info, i) => {
+  info.forEach((info, i) => {
     info.char_code = i;
-    info.std = std(info.lines);
+    info.std = std$1(info.lines);
     info.total = info.lines.reduce((acc, val) => acc + val, 0);
     info.preferred = !!options.preferred[i];
     info.score = options.score(info, options);
   });
-  // Extract the dominant character
-  const result = info.reduce(
-    (acc, info) => (acc.score > info.score ? acc : info),
-    {},
-  );
-  return String.fromCharCode(result.char_code);
+  const recordCount = recordCodes.length;
+  const eligible = (info) =>
+    !delimiter_discover_excluded_codes$1.includes(info.char_code) &&
+    info.total > 0;
+  // Winner selection keeps the historical behavior: the highest-scoring
+  // eligible character wins even when its field count is inconsistent across
+  // records. This preserves the documented `delimiter_discover` utility.
+  const result = info
+    .filter(eligible)
+    .reduce((acc, info) => (acc.score > info.score ? acc : info), {
+      score: 0,
+    });
+  // Trust is evaluated independently of the winner selection. A trustworthy
+  // delimiter must satisfy the structural field-count test and have enough
+  // complete records to compare. This is what prevents a frequent content
+  // character (e.g. the letter "a" shared by every row) from silently becoming
+  // the delimiter.
+  result.trusted =
+    result.char_code !== undefined &&
+    recordCount >= minRecords &&
+    delimiter_structural_match$1(recordCodes, result.char_code);
+  return result;
 };
 
-const std = function (array) {
+const delimiter_discover = function (records, options) {
+  // Normalize the configuration
+  if (!options) {
+    ({ delimiter_auto: options } = normalize_options$1({ delimiter_auto: true }));
+  }
+  const result = delimiter_score$1(delimiter_records$1(records), options);
+  return String.fromCharCode(result.char_code === undefined ? 0 : result.char_code);
+};
+
+const std$1 = function (array) {
   const n = array.length;
   if (n === 0) return 0;
   const mean = array.reduce((a, b) => a + b) / n;
@@ -6539,11 +6640,55 @@ const transform$1 = function (original_options = {}) {
         nextBuf = undefined;
         // this.delimiterBufPrevious = delimiterBuf;
         if (end || delimiterBuf.length > delimiter_auto.size) {
-          this.options.delimiter = [
-            Buffer.from(
-              delimiter_discover(delimiterBuf, this.options.delimiter_auto),
-            ),
-          ];
+          // Score every candidate against the sampling window. The discovery
+          // uses the exact same routine and options as `csv-stringify`, so the
+          // two sides of a pipeline converge on the same delimiter.
+          let recordCodes = delimiter_records$1(delimiterBuf);
+          // On a size-driven (streaming) cutoff the last record may be
+          // truncated in the middle of a line, which would make its field
+          // count differ from the complete rows and wrongly fail the
+          // structural test. Discard it before scoring. On `end` every record
+          // is complete, so nothing is discarded.
+          let minRecords = 2;
+          if (!end && recordCodes.length > 1) {
+            recordCodes = recordCodes.slice(0, -1);
+          }
+          // A very small window can leave a single complete record. A
+          // delimiter can still be trusted on that record alone as long as it
+          // splits it into at least two fields.
+          if (recordCodes.length === 1) minRecords = 1;
+          // An empty sample preserves the historical empty-input behavior:
+          // parsing resolves to no records instead of a discovery error.
+          if (recordCodes.length > 0) {
+            const result = delimiter_score$1(
+              recordCodes,
+              this.options.delimiter_auto,
+              minRecords,
+            );
+            // Refuse to silently ingest data when no trustworthy delimiter can
+            // be discovered, instead of electing an arbitrary content character.
+            if (!result.trusted) {
+              return new CsvError$1(
+                "CSV_DELIMITER_NOT_DISCOVERED",
+                [
+                  "Invalid delimiter discovery:",
+                  "no field delimiter could be discovered from the sampled data,",
+                  `sampled ${delimiterBuf.length} bytes over a maximum window of ${delimiter_auto.size} bytes,`,
+                  "set the `delimiter` option explicitly to parse this data",
+                ],
+                this.options,
+              );
+            }
+            this.options.delimiter = [
+              Buffer.from(String.fromCharCode(result.char_code)),
+            ];
+          } else {
+            this.options.delimiter = [
+              Buffer.from(
+                delimiter_discover(delimiterBuf, this.options.delimiter_auto),
+              ),
+            ];
+          }
           this.state.previousBuf = delimiterBuf;
           this.state.delimiterBufPrevious = undefined;
           this.state.delimiterDiscovered = true;
@@ -7206,7 +7351,7 @@ const transform$1 = function (original_options = {}) {
         }
       }
       if (this.__isFloat(field)) {
-        return [undefined, parseFloat(field)];
+        return [undefined, Number(field)];
       } else if (this.options.cast_date !== false) {
         const info = this.__infoField();
         return [undefined, this.options.cast_date.call(null, field, info)];
@@ -7400,8 +7545,9 @@ const parse = function (data, opts = {}) {
   if (typeof data === "string") {
     data = Buffer.from(data);
   }
-  const records = opts && opts.objname ? Object.create(null) : [];
   const parser = transform$1(opts);
+  const records =
+    parser.options.objname === undefined ? [] : Object.create(null);
   const push = (record) => {
     if (parser.options.objname === undefined) records.push(record);
     else {
@@ -7517,6 +7663,27 @@ const is_object = function (obj) {
   return typeof obj === "object" && obj !== null && !Array.isArray(obj);
 };
 
+class CsvError extends Error {
+  constructor(code, message, ...contexts) {
+    if (Array.isArray(message)) message = message.join(" ");
+    super(message);
+    if (Error.captureStackTrace !== undefined) {
+      Error.captureStackTrace(this, CsvError);
+    }
+    this.code = code;
+    for (const context of contexts) {
+      for (const key in context) {
+        const value = context[key];
+        this[key] = isBuffer$1(value)
+          ? value.toString()
+          : value == null
+            ? value
+            : JSON.parse(JSON.stringify(value));
+      }
+    }
+  }
+}
+
 const normalize_columns = function (columns) {
   if (columns === undefined || columns === null) {
     return [undefined, undefined];
@@ -7566,31 +7733,156 @@ const normalize_columns = function (columns) {
   return [undefined, columns];
 };
 
-class CsvError extends Error {
-  constructor(code, message, ...contexts) {
-    if (Array.isArray(message)) message = message.join(" ");
-    super(message);
-    if (Error.captureStackTrace !== undefined) {
-      Error.captureStackTrace(this, CsvError);
-    }
-    this.code = code;
-    for (const context of contexts) {
-      for (const key in context) {
-        const value = context[key];
-        this[key] = isBuffer$1(value)
-          ? value.toString()
-          : value == null
-            ? value
-            : JSON.parse(JSON.stringify(value));
-      }
-    }
-  }
-}
-
 const underscore = function (str) {
   return str.replace(/([A-Z])/g, function (_, match) {
     return "_" + match.toLowerCase();
   });
+};
+
+// Automatic field delimiter discovery for `csv-stringify`.
+//
+// This module is the stringifying-side mirror of
+// `csv-parse/lib/utils/delimiter_discover.js`. The two packages do not depend
+// on each other, so the sampling window, the candidate scoring formula, the
+// preferred characters and the trust criteria are duplicated here on purpose:
+// any change must be applied on both sides so the same payload yields the same
+// delimiter decision whether it is parsed or stringified.
+
+// Number of characters inspected by default, shared with `csv-parse`. Parsing
+// counts bytes on the raw buffer while stringifying counts cast field
+// characters; both cap the sampling window at the same 2048 units.
+const delimiter_discover_default_size = 2048;
+// Character codes excluded from the candidate set: a field delimiter cannot be
+// a line break (the record delimiter) or the NUL character (an empty sample).
+const delimiter_discover_excluded_codes = [0, 10, 13];
+// A candidate is only trustworthy when every sampled record contains it and
+// the sample spans at least two records. Must stay identical to the
+// parsing-side criterion in
+// `csv-parse/lib/utils/delimiter_discover.js`.
+const delimiter_discover_min_records = 2;
+
+// Default preferred characters and their boost, identical to the parsing-side
+// normalization in `csv-parse/lib/api/normalize_options.js`.
+const delimiter_discover_default_preferred = {
+  [",".charCodeAt(0)]: 1.8,
+  ["\t".charCodeAt(0)]: 1.8,
+  [";".charCodeAt(0)]: 1.6,
+  [" ".charCodeAt(0)]: 1.6,
+  [":".charCodeAt(0)]: 1.5,
+  [".".charCodeAt(0)]: 1.4,
+  ["/".charCodeAt(0)]: 1.4,
+};
+
+const delimiter_discover_default_score = (info, options) => {
+  return (
+    (info.total - info.std) * (options.preferred[info.char_code] || 1)
+  );
+};
+
+const std = function (array) {
+  const n = array.length;
+  if (n === 0) return 0;
+  const mean = array.reduce((a, b) => a + b) / n;
+  return Math.sqrt(
+    array.map((x) => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / n,
+  );
+};
+
+// Convert buffered input records into an array of records, each record being
+// an array of character codes. Fields are cast the same way they are when
+// emitted, so the scored sample reflects the actual serialized output. The
+// returned object carries the first casting error, if any.
+const delimiter_records = function (records, columns, cast) {
+  const recordCodes = [];
+  for (let recordsIndex = 0; recordsIndex < records.length; recordsIndex++) {
+    const chunk = records[recordsIndex];
+    const fields = [];
+    if (Array.isArray(chunk)) {
+      for (let i = 0; i < chunk.length; i++) fields.push(chunk[i]);
+    } else {
+      for (const column of columns) fields.push(get(chunk, column.key));
+    }
+    const codes = [];
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i];
+      const [err, value] = cast(field, {
+        index: i,
+        column: Array.isArray(chunk) ? i : columns[i].key,
+        records: recordsIndex,
+        header: false,
+      });
+      if (err !== undefined) return { err };
+      if (value === null || value === undefined) continue;
+      const str = String(value);
+      for (let j = 0; j < str.length; j++) {
+        codes.push(str.charCodeAt(j));
+      }
+    }
+    recordCodes.push(codes);
+  }
+  return { recordCodes };
+};
+
+// Structural test, identical to the parsing-side one in
+// `csv-parse/lib/utils/delimiter_discover.js`: splitting every sampled record
+// on a candidate must yield the same number of fields and more than one.
+// Stringified records are always complete, so there is no truncation to
+// tolerate here.
+const delimiter_structural_match = function (recordCodes, charCode) {
+  let fieldCount;
+  for (const codes of recordCodes) {
+    let count = 1;
+    for (const code of codes) if (code === charCode) count++;
+    if (count === 1) return false;
+    if (fieldCount === undefined) fieldCount = count;
+    else if (fieldCount !== count) return false;
+  }
+  return fieldCount !== undefined && fieldCount >= 2;
+};
+
+// Core scoring routine, byte-for-byte equivalent in intent to the parsing-side
+// `delimiter_score`: same 127 character-code slots, same frequency / standard
+// deviation computation and same trust criterion.
+const delimiter_score = function (
+  recordCodes,
+  options,
+  minRecords = delimiter_discover_min_records,
+) {
+  const info = Array(127)
+    .fill()
+    .map(() => ({ lines: [], records: 0 }));
+  recordCodes.forEach((codes, line) => {
+    for (const code of codes) {
+      if (info[code].lines[line] === undefined) {
+        info[code].lines[line] = 0;
+        info[code].records++;
+      }
+      info[code].lines[line]++;
+    }
+  });
+  info.forEach((info, i) => {
+    info.char_code = i;
+    info.std = std(info.lines);
+    info.total = info.lines.reduce((acc, val) => acc + val, 0);
+    info.preferred = !!options.preferred[i];
+    info.score = options.score(info, options);
+  });
+  const recordCount = recordCodes.length;
+  const eligible = (info) =>
+    !delimiter_discover_excluded_codes.includes(info.char_code) &&
+    info.total > 0;
+  // Winner selection mirrors the parsing side: the highest-scoring eligible
+  // character wins. Trust is then evaluated independently.
+  const result = info
+    .filter(eligible)
+    .reduce((acc, info) => (acc.score > info.score ? acc : info), {
+      score: 0,
+    });
+  result.trusted =
+    result.char_code !== undefined &&
+    recordCount >= minRecords &&
+    delimiter_structural_match(recordCodes, result.char_code);
+  return result;
 };
 
 const normalize_options = function (opts) {
@@ -7615,7 +7907,17 @@ const normalize_options = function (opts) {
     ];
   }
   // Normalize option `delimiter`
+  // The literal "auto" (string or buffer) requests automatic discovery from
+  // the incoming records. Without this conversion it would be emitted as a
+  // literal four-character separator, fusing every column into one string.
+  const delimiter_auto_requested =
+    options.delimiter === "auto" ||
+    (isBuffer$1(options.delimiter) &&
+      options.delimiter.toString() === "auto");
   if (options.delimiter === undefined || options.delimiter === null) {
+    options.delimiter = ",";
+  } else if (delimiter_auto_requested) {
+    // Comma is only a placeholder until discovery runs on the first records.
     options.delimiter = ",";
   } else if (isBuffer$1(options.delimiter)) {
     options.delimiter = options.delimiter.toString();
@@ -7626,6 +7928,21 @@ const normalize_options = function (opts) {
         `got ${JSON.stringify(options.delimiter)}`,
       ]),
     ];
+  }
+  // Automatic discovery configuration is internal to the stringifier. It is
+  // stored as a non-enumerable property so the public `options` shape (and its
+  // enumerated keys) stays identical to the explicit-delimiter behavior.
+  if (delimiter_auto_requested) {
+    Object.defineProperty(options, "delimiter_auto", {
+      value: {
+        preferred: delimiter_discover_default_preferred,
+        score: delimiter_discover_default_score,
+        size: delimiter_discover_default_size,
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
   }
   // Normalize option `quote`
   if (options.quote === undefined || options.quote === null) {
@@ -7641,6 +7958,17 @@ const normalize_options = function (opts) {
       new CsvError("CSV_OPTION_QUOTE_INVALID_TYPE", [
         "option `quote` must be a boolean, a buffer or a string,",
         `got ${JSON.stringify(options.quote)}`,
+      ]),
+    ];
+  }
+  // Normalize option `relax_quotes`
+  if (options.relax_quotes === undefined || options.relax_quotes === null) {
+    options.relax_quotes = false;
+  } else if (typeof options.relax_quotes !== "boolean") {
+    return [
+      new CsvError("CSV_OPTION_RELAX_QUOTES_INVALID_TYPE", [
+        "option `relax_quotes` must be a boolean,",
+        `got ${JSON.stringify(options.relax_quotes)}`,
       ]),
     ];
   }
@@ -7780,6 +8108,8 @@ const normalize_options = function (opts) {
   // Normalize option `cast`
   if (options.cast === undefined || options.cast === null) {
     options.cast = {};
+  } else {
+    options.cast = { ...options.cast };
   }
   // Normalize option cast.bigint
   if (options.cast.bigint === undefined || options.cast.bigint === null) {
@@ -7907,6 +8237,65 @@ const stringifier = function (options, state, info) {
     options: options,
     state: state,
     info: info,
+    // Record buffering used while the field delimiter is discovered. `buffer`
+    // holds the input records and `buffer_size` tracks their cast character
+    // count to apply the same sampling window as the parsing side.
+    state_auto: {
+      buffer: [],
+      size: 0,
+    },
+    // Run automatic delimiter discovery over the buffered records and, on
+    // success, emit every buffered record again through the regular path.
+    __delimiter_auto_finalize: function (push) {
+      const { err, recordCodes } = delimiter_records(
+        this.state_auto.buffer,
+        this.options.columns,
+        (value, context) => this.__cast(value, context),
+      );
+      if (err !== undefined) return err;
+      const result = delimiter_score(recordCodes, this.options.delimiter_auto);
+      if (!result.trusted) {
+        return new CsvError("CSV_OPTION_DELIMITER_AUTO_UNDISCOVERABLE", [
+          "Invalid option `delimiter`:",
+          "no field delimiter could be discovered from the sampled records,",
+          `sampled ${this.state_auto.size} characters over a maximum window of ${this.options.delimiter_auto.size} characters,`,
+          "set the `delimiter` option explicitly to stringify this data",
+        ]);
+      }
+      this.options.delimiter = String.fromCharCode(result.char_code);
+      const buffered = this.state_auto.buffer;
+      this.state_auto.buffer = [];
+      this.state_auto.size = 0;
+      this.state.pending_delimiter_auto = false;
+      for (const record of buffered) {
+        const err = this.__transform(record, push);
+        if (err !== undefined) return err;
+      }
+      return undefined;
+    },
+    // Cast one record and return the total length of its serialized fields.
+    // Used only to bound the discovery sampling window.
+    __delimiter_auto_record_size: function (chunk) {
+      const fields = [];
+      if (Array.isArray(chunk)) {
+        for (const field of chunk) fields.push(field);
+      } else {
+        for (const column of this.options.columns)
+          fields.push(get(chunk, column.key));
+      }
+      let size = 0;
+      for (let i = 0; i < fields.length; i++) {
+        const [err, value] = this.__cast(fields[i], {
+          index: i,
+          column: Array.isArray(chunk) ? i : this.options.columns[i].key,
+          records: this.info.records,
+          header: false,
+        });
+        if (err !== undefined) return undefined;
+        if (value !== null && value !== undefined) size += String(value).length;
+      }
+      return size;
+    },
     __transform: function (chunk, push) {
       // Chunk validation
       if (!Array.isArray(chunk) && typeof chunk !== "object") {
@@ -7930,6 +8319,27 @@ const stringifier = function (options, state, info) {
           if (err) return;
           this.options.columns = columns;
         }
+      }
+      // Automatic delimiter discovery: keep buffering records until the
+      // sampling window is filled. The window and the scoring are identical to
+      // `csv-parse`, so both sides converge on the same delimiter.
+      if (this.state.pending_delimiter_auto === true) {
+        const size = this.__delimiter_auto_record_size(chunk);
+        if (size === undefined) {
+          return new CsvError("CSV_OPTION_DELIMITER_AUTO_UNDISCOVERABLE", [
+            "Invalid option `delimiter`:",
+            "a field could not be cast while sampling records for delimiter discovery,",
+            "set the `delimiter` option explicitly to stringify this data",
+          ]);
+        }
+        this.state_auto.buffer.push(chunk);
+        this.state_auto.size += size;
+        if (this.state_auto.size < this.options.delimiter_auto.size) {
+          return;
+        }
+        const err = this.__delimiter_auto_finalize(push);
+        if (err !== undefined) return err;
+        return;
       }
       // Emit the header
       if (this.info.records === 0) {
@@ -8028,12 +8438,11 @@ const stringifier = function (options, state, info) {
             value !== undefined &&
             value !== null
           ) {
-            if (err)
-              return [
-                Error(
-                  `Invalid Casting Value: returned value must return a string, null or undefined, got ${JSON.stringify(value)}`,
-                ),
-              ];
+            return [
+              Error(
+                `Invalid Casting Value: returned value must return a string, null or undefined, got ${JSON.stringify(value)}`,
+              ),
+            ];
           }
           // Merge global options with the ones returned by cast
           options = { ...this.options, ...options };
@@ -8054,6 +8463,7 @@ const stringifier = function (options, state, info) {
           delimiter,
           escape,
           quote,
+          relax_quotes,
           quoted,
           quoted_empty,
           quoted_string,
@@ -8118,16 +8528,20 @@ const stringifier = function (options, state, info) {
             }
           }
           const shouldQuote =
-            containsQuote === true ||
+            (containsQuote === true &&
+              (relax_quotes === false ||
+                value.trimStart().startsWith(quote))) ||
             containsdelimiter ||
             containsRecordDelimiter ||
             quoted ||
             quotedString ||
             quotedMatch;
+          // Escape all escape characters if quoted
           if (shouldQuote === true && containsEscape === true) {
             value = value.replaceAll(escape, () => escape + escape);
           }
-          if (containsQuote === true) {
+          // Escape all quote characters if quoted
+          if (shouldQuote === true) {
             value = value.replaceAll(quote, () => escape + quote);
           }
           if (shouldQuote === true) {
@@ -8220,6 +8634,8 @@ const stringify = function (records, opts = {}) {
   if (err !== undefined) throw err;
   const state = {
     stop: false,
+    // Set while records are buffered for automatic delimiter discovery
+    pending_delimiter_auto: options.delimiter_auto !== undefined,
   };
   // Information
   const info = {
@@ -8228,6 +8644,14 @@ const stringify = function (records, opts = {}) {
   const api = stringifier(options, state, info);
   for (const record of records) {
     const err = api.__transform(record, function (record) {
+      data.push(record);
+    });
+    if (err !== undefined) throw err;
+  }
+  // Finalize automatic delimiter discovery with the buffered records. Empty
+  // inputs keep their historical header-only / empty-string behavior.
+  if (state.pending_delimiter_auto === true && api.state_auto.buffer.length > 0) {
+    const err = api.__delimiter_auto_finalize((record) => {
       data.push(record);
     });
     if (err !== undefined) throw err;
@@ -8293,7 +8717,7 @@ Transformer.prototype._transform = function (chunk, _, cb) {
     if (l === 1) {
       // sync
       const result = this.handler.call(this, chunk, this.options.params);
-      if (result && result.then) {
+      if (result && typeof result.then === "function") {
         result.then(
           (result) => {
             this.__done(null, [result], cb);
@@ -8386,7 +8810,7 @@ const transform = function () {
   }
   // Validate arguments
   let expected_handler_length = 1;
-  if (options.params) {
+  if (options.params !== undefined && options.params !== null) {
     expected_handler_length++;
   }
   if (handler.length > expected_handler_length) {

@@ -192,6 +192,19 @@ const normalize_options = function (opts) {
     );
   }
   // Normalize option `delimiter_auto`
+  // The literal string "auto" on `delimiter` is an explicit request for
+  // automatic discovery, equivalent to `delimiter_auto: true`. It must be
+  // handled before `delimiter` is turned into a buffer, otherwise the four
+  // characters "auto" would be treated as a literal multi-character delimiter.
+  if (
+    options.delimiter === "auto" ||
+    (!Array.isArray(options.delimiter) &&
+      Buffer.isBuffer(options.delimiter) &&
+      options.delimiter.toString() === "auto")
+  ) {
+    if (options.delimiter_auto === undefined) options.delimiter_auto = true;
+    options.delimiter = undefined;
+  }
   if (
     options.delimiter_auto === undefined ||
     options.delimiter_auto === null ||
